@@ -62,8 +62,10 @@ python server.py --http --host 127.0.0.1 --port 8765
 
 Esto abre el transporte HTTP del MCP en: http://127.0.0.1:8765
 
-## 3) Exponer  MCP con un túnel público — Terminal C
+## 3) Exponer MCP con un túnel público — Terminal C
+
 en caos de no tenerlo: winget install Cloudflare.cloudflared
+
 ```bash
 cloudflared tunnel --url http://127.0.0.1:8765
 ```
@@ -177,6 +179,159 @@ Los chatbots anfitriones deben:
 
 - llamar tools/list para leer inputSchema
 - luego llamar tools/call con name y arguments.
+
+## A) connect
+
+- arguments:
+
+```BASH
+{ "dsn": "postgresql://mcp:mcp123@localhost:5432/mcpdb" }
+```
+
+- result (ejemplo):
+
+```BASH
+{
+  "connected": true,
+  "dsn": "postgresql://mcp:mcp123@localhost:5432/mcpdb",
+  "meta": {
+    "server_version": "...",
+    "extensions_installed": ["plpgsql", "pg_stat_statements"],
+    "extensions_available": ["pg_stat_statements", "hypopg", "..."],
+    "pg_stat_statements": true,
+    "hypopg": false
+  }
+}
+```
+
+## B) explain
+
+- arguments:
+
+```BASH
+{
+  "sql": "SELECT ...",
+  "analyze": true,
+  "buffers": true,
+  "timing": true
+}
+```
+
+- result (resumen):
+
+```BASH
+{
+  "plan": [ { "Plan": { ... }, "Execution Time": 0.88 } ],
+  "summary": {
+    "dominant_node": { "node_type": "Limit", "metric": 0.854, "relation": null, "index_name": null },
+    "plan_width": 28,
+    "startup_cost": null,
+    "total_cost": null,
+    "actual_rows": 5,
+    "actual_total_time_ms": 0.854
+  }
+}
+```
+
+## C) slow_queries
+
+- arguments:
+
+```BASH
+{ "top": 10 }
+```
+
+- result:
+
+```BASH
+{
+  "pg_stat_statements": true,
+  "stats_reset": "2025-08-31T15:37:21.055545+00:00",
+  "top": [
+    { "queryid":"...", "calls":1, "rows":16000, "total_ms":67.97, "mean_ms":67.97, "normalized":"insert into ..." }
+  ]
+}
+```
+
+## D) n_plus_one_suspicions
+
+- arguments:
+
+```BASH
+{ "min_calls": 500, "max_avg_rows": 2, "min_mean_ms": 0.002 }
+```
+
+- result:
+
+```BASH
+{
+  "pg_stat_statements": true,
+  "suspicions": [
+    { "normalized":"select $? from only \"public\".\"users\" ...", "calls":120000, "avg_rows":1, "mean_ms":0.002005 }
+  ]
+}
+```
+
+## E) index_suggestions
+
+- arguments:
+
+```BASH
+{
+  "table": "public.users",
+  "sample_sql": "SELECT id, email FROM users WHERE country='GT' ORDER BY email LIMIT 100;",
+  "validate_with_hypopg": true
+}
+```
+
+- result:
+
+```BASH
+{
+  "explanation": [
+    {
+      "eq_cols": ["country"],
+      "range_cols": [],
+      "order_cols": [{ "column": "email", "direction": "asc" }],
+      "target_alias": "users"
+    }
+  ],
+  "suggestions": [
+    {
+      "table": "public.users",
+      "columns_ordered": ["country", "email"],
+      "create_index_sql": "CREATE INDEX ON public.users (country, email)"
+    }
+  ]
+}
+```
+
+# Cómo ejecutarlo local y exponerlo
+
+## 1. Inicia el servidor en modo JSON-RPC
+
+```BASH
+python server.py --jsonrpc --rpc-host 127.0.0.1 --rpc-port 8787
+```
+
+## 2. Expón una URL pública
+
+cloudflared:
+
+- cloudflared tunnel --url http://localhost:8787
+- Usa la URL mostrada.
+
+## 3. Entrega al integrador:
+
+- Base URL pública (ej. https://abc123.BLABLA.io/)
+- Esta sección de endpoints (métodos y schemas)
+
+## Cómo lo usa un chatbot remoto (resumen)
+
+- POST / con {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+- Leer inputSchema, construir formularios/parsers.
+- POST / con {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"connect","arguments":{"dsn":"..."}}}
+- Llamar explain, slow_queries, etc., según el flujo de su chatbot.
 
 ## Algunos ejemplos para pruebas del funcionamiento del Postgres Profiles
 
