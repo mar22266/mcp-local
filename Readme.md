@@ -62,10 +62,8 @@ python server.py --http --host 127.0.0.1 --port 8765
 
 Esto abre el transporte HTTP del MCP en: http://127.0.0.1:8765
 
-## 3) Exponer tu MCP con un túnel público — Terminal C
-
-# si no lo tienes: winget install Cloudflare.cloudflared
-
+## 3) Exponer  MCP con un túnel público — Terminal C
+en caos de no tenerlo: winget install Cloudflare.cloudflared
 ```bash
 cloudflared tunnel --url http://127.0.0.1:8765
 ```
