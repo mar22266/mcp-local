@@ -601,27 +601,278 @@ def index_suggestions(
     return {"explanation": explanation, "suggestions": suggestions}
 
 
+# JSON-RPC SHIM expone POST / con  initialize, tools/list, tools/call
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+import uvicorn
+
+
+# JSON-RPC 2.0 plano en POST / para máxima interoperabilidad.
+# initialize / notifications/initialized
+# tools/list (y tools.list): devuelve herramientas con inputSchema detallado
+# tools/call  (y tools.call): invoca las funciones MCP reales
+def build_jsonrpc_app() -> FastAPI:
+    app = FastAPI(title="PG Profiler MCP (JSON-RPC)")
+    # Mapa de herramientas reales a funciones Python
+    TOOLS_MAP = {
+        "connect": connect,
+        "explain": explain,
+        "slow_queries": slow_queries,
+        "n_plus_one_suspicions": n_plus_one_suspicions,
+        "index_suggestions": index_suggestions,
+    }
+
+    def _ok(rid, result):
+        return {"jsonrpc": "2.0", "id": rid, "result": result}
+
+    def _err(rid, code, msg):
+        return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
+
+    @app.post("/")
+    async def jsonrpc_entry(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse(_err(None, -32700, "Parse error"), status_code=400)
+
+        rid = payload.get("id")
+        method = (payload.get("method") or "").strip()
+        params = payload.get("params") or {}
+
+        # handshake sin estado
+        if method == "initialize":
+            return JSONResponse(_ok(rid, {"capabilities": {}}))
+        if method in ("notifications/initialized", "initialized"):
+            return JSONResponse(_ok(rid, {}))
+
+        # listar herramientas
+        if method in ("tools/list", "tools.list"):
+            tools = [
+                {
+                    "name": "connect",
+                    "description": "Abre una conexión a PostgreSQL con un DSN.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dsn": {
+                                "type": "string",
+                                "description": "DSN de PostgreSQL. Ej: postgresql://user:pass@host:5432/db",
+                            }
+                        },
+                        "required": ["dsn"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "explain",
+                    "description": "Ejecuta EXPLAIN/EXPLAIN ANALYZE en formato JSON.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "sql": {
+                                "type": "string",
+                                "description": "Consulta SQL completa a explicar.",
+                            },
+                            "analyze": {
+                                "type": "boolean",
+                                "description": "Si true, usa EXPLAIN ANALYZE.",
+                                "default": True,
+                            },
+                            "buffers": {
+                                "type": "boolean",
+                                "description": "Incluir métricas de buffers.",
+                                "default": True,
+                            },
+                            "timing": {
+                                "type": "boolean",
+                                "description": "Incluir métricas de tiempo por nodo.",
+                                "default": True,
+                            },
+                        },
+                        "required": ["sql"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "slow_queries",
+                    "description": "Lista queries lentas desde pg_stat_statements (top N por mean_exec_time).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "top": {
+                                "type": "integer",
+                                "description": "Cantidad de filas a devolver.",
+                                "default": 20,
+                                "minimum": 1,
+                                "maximum": 1000,
+                            }
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "n_plus_one_suspicions",
+                    "description": "Heurística para detectar patrón N+1 usando pg_stat_statements.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "min_calls": {
+                                "type": "integer",
+                                "description": "Mínimo de llamadas por plantilla para considerarla.",
+                                "default": 20,
+                                "minimum": 1,
+                            },
+                            "max_avg_rows": {
+                                "type": "number",
+                                "description": "Umbral máximo de filas promedio por llamada (bajo = sospechoso).",
+                                "default": 3.0,
+                                "minimum": 0,
+                            },
+                            "min_mean_ms": {
+                                "type": "number",
+                                "description": "Umbral mínimo de tiempo medio en ms.",
+                                "default": 0.5,
+                                "minimum": 0,
+                            },
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "index_suggestions",
+                    "description": "Propone índices compuestos (igualdades→rangos→ORDER BY). Puede validar con HypoPG.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "table": {
+                                "type": "string",
+                                "description": "Tabla objetivo (schema.qualname). Ej: public.orders",
+                            },
+                            "sample_sql": {
+                                "type": "string",
+                                "description": "SQL de ejemplo sobre el que derivar las columnas candidatas.",
+                            },
+                            "validate_with_hypopg": {
+                                "type": "boolean",
+                                "description": "Si true, valida con HypoPG (si disponible).",
+                                "default": True,
+                            },
+                        },
+                        "required": ["table", "sample_sql"],
+                        "additionalProperties": False,
+                    },
+                },
+            ]
+            return JSONResponse(_ok(rid, {"tools": tools}))
+
+        # llama a la herramienta de las funciones definidas arriba
+        if method in ("tools/call", "tools.call"):
+            name = (params.get("name") or "").strip()
+            arguments = params.get("arguments") or {}
+            fn = TOOLS_MAP.get(name)
+            if not fn:
+                return JSONResponse(
+                    _err(rid, -32601, f"Unknown tool: {name}"), status_code=404
+                )
+            try:
+                result = fn(**arguments)
+                return JSONResponse(_ok(rid, result))
+            except TypeError as e:
+                # error de parámetros
+                return JSONResponse(
+                    _err(rid, -32602, f"Invalid params: {e}"), status_code=400
+                )
+            except Exception as e:
+                # error interno de la herramienta
+                return JSONResponse(
+                    _err(rid, -32000, f"Tool error: {e}"), status_code=500
+                )
+
+        # metodo no encontrado
+        return JSONResponse(
+            _err(rid, -32601, f"Method not found: {method}"), status_code=404
+        )
+
+    return app
+
+
 # el main usa argparse para elegir transporte y parámetros http streamable o stdio
 def main():
     load_dotenv()
+
     parser = argparse.ArgumentParser(description="PG Profiler MCP Server")
+    # Modo HTTP streamable
     parser.add_argument(
         "--http",
         action="store_true",
-        help="USA TRANSPORTE HTTP STREAMABLE (POR DEFECTO STDIO)",
+        help="Transporte HTTP streamable (compatible con MCP Inspector).",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="HOST HTTP (SI --http)")
     parser.add_argument(
-        "--port", type=int, default=8765, help="PUERTO HTTP (SI --http)"
+        "--host",
+        default="127.0.0.1",
+        help="Host para streamable-http (si usas --http).",
     )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Puerto para streamable-http (si usas --http).",
+    )
+
+    # Modo JSON-RPC plano
+    parser.add_argument(
+        "--jsonrpc",
+        action="store_true",
+        help="Exponer JSON-RPC 2.0 'plano' en POST / (máxima interoperabilidad).",
+    )
+    parser.add_argument(
+        "--rpc-host",
+        default="127.0.0.1",
+        help="Host para JSON-RPC (si usas --jsonrpc).",
+    )
+    parser.add_argument(
+        "--rpc-port",
+        type=int,
+        default=8787,
+        help="Puerto para JSON-RPC (si usas --jsonrpc).",
+    )
+
+    # Forzar stdio explícito
+    parser.add_argument(
+        "--stdio",
+        action="store_true",
+        help="Forzar transporte STDIO (por defecto si no se pasan flags).",
+    )
+
     args = parser.parse_args()
 
+    # No permitimos mezclar http y jsonrpc en un solo proceso
+    if args.http and args.jsonrpc:
+        print(
+            "Error: no combines --http y --jsonrpc en el mismo proceso. "
+            "Ejecuta cada modo en una terminal/proceso distinto."
+        )
+        return
+
+    # JSON-RPC plano
+    if args.jsonrpc:
+        # debe estar definida arriba del archivo (shim JSON-RPC)
+        app = build_jsonrpc_app()
+        uvicorn.run(app, host=args.rpc_host, port=args.rpc_port)
+        return
+
+    # HTTP streamable Inspector
     if args.http:
         mcp.settings.host = args.host
         mcp.settings.port = args.port
         mcp.run(transport="streamable-http")
-    else:
-        mcp.run()
+        return
+
+    # STDIO
+    mcp.run()
+    return
 
 
 if __name__ == "__main__":

@@ -76,6 +76,110 @@ Te dará una URL pública tipo: https://<algo>.trycloudflare.com
 
 ### El INTEGRATOR no necesita acceso a tu Postgres ni correr Docker; solo consumirá tu MCP por HTTP.
 
+## MCP Local — Endpoints y Contrato JSON-RPC
+
+Este servidor expone JSON-RPC 2.0 sobre HTTP en un único endpoint.
+
+### Endpoint y Transporte
+
+- Endpoint HTTP: POST /
+- Contenido: application/json
+- Base URL local (por defecto): http://127.0.0.1:8787/
+- Base URL pública (con túnel): https://<tu-subdominio>.<tunnel>
+
+## Métodos JSON-RPC soportados
+
+### 1) initialize (handshake opcional)
+
+- params: { "protocolVersion": "YYYY-MM-DD", "capabilities": {} }
+- result: { "capabilities": {} }
+
+### 2) notifications/initialized (handshake opcional)
+
+- params: {}
+- result: {}
+
+### 3) tools/list (alias aceptado: tools.list)
+
+- params: {}
+- result:
+
+```bash
+{
+  "tools": [
+    { "name": "connect",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dsn": { "type": "string", "description": "postgresql://user:pass@host:5432/db" }
+        },
+        "required": ["dsn"],
+        "additionalProperties": false
+      }
+    },
+    { "name": "explain",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "sql":     { "type": "string" },
+          "analyze": { "type": "boolean", "default": true },
+          "buffers": { "type": "boolean", "default": true },
+          "timing":  { "type": "boolean", "default": true }
+        },
+        "required": ["sql"],
+        "additionalProperties": false
+      }
+    },
+    { "name": "slow_queries",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "top": { "type": "integer", "default": 20, "minimum": 1, "maximum": 1000 }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    { "name": "n_plus_one_suspicions",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "min_calls":   { "type": "integer", "default": 20,  "minimum": 1 },
+          "max_avg_rows":{ "type": "number",  "default": 3.0, "minimum": 0 },
+          "min_mean_ms": { "type": "number",  "default": 0.5, "minimum": 0 }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    { "name": "index_suggestions",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "table": { "type": "string", "description": "schema.tabla, ej: public.orders" },
+          "sample_sql": { "type": "string" },
+          "validate_with_hypopg": { "type": "boolean", "default": true }
+        },
+        "required": ["table","sample_sql"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
+```
+
+### 4) tools/call (alias aceptado: tools.call)
+
+- params: { "name": "<tool_name>", "arguments": { ... } }
+- result: estructura específica de cada herramienta (ver abajo).
+
+## Herramientas (esquemas y ejemplos de payload)
+
+Los chatbots anfitriones deben:
+
+- llamar tools/list para leer inputSchema
+- luego llamar tools/call con name y arguments.
+
 ## Algunos ejemplos para pruebas del funcionamiento del Postgres Profiles
 
 ## Tabla de Pruebas
@@ -101,3 +205,5 @@ Si sigues los pasos anteriores, estos son algunos ejemplos de pruebas que puedes
 | **N+1 SUSPICIONS**    | 2           | `min_calls: 150`<br>`max_avg_rows: 3`<br>`min_mean_ms: 0.001`                                                                                    | —                                          | **Carga N+1 básica:**<br>`docker exec -it mcp-postgres psql -U mcp -d mcpdb -c "DO $$ DECLARE r RECORD; BEGIN FOR r IN SELECT ID FROM ORDERS ORDER BY ID DESC LIMIT 2000 LOOP PERFORM 1 FROM ORDER_ITEMS WHERE ORDER_ID = r.ID LIMIT 1; END LOOP; END $$;"`                                                                                                                 | Detecta N+1                                                                                           |
 | **INDEX SUGGESTIONS** | 1           | `table: public.orders`<br>`sample_sql:`<br>`SELECT ID, CREATED_AT FROM ORDERS WHERE USER_ID = 12345 ORDER BY CREATED_AT DESC LIMIT 50;`          | validate_with_hypopg ON (si tienes hypopg) | **Habilitar HypoPG (una vez):**<br>`docker exec -it mcp-postgres psql -U mcp -d mcpdb -c "CREATE EXTENSION IF NOT EXISTS HYPOPG;"`                                                                                                                                                                                                                                          | Sugerencia esperable: **ON public.orders (user_id, created_at DESC) [INCLUDE (id)]**                  |
 | **INDEX SUGGESTIONS** | 2           | `table: public.users`<br>`sample_sql:`<br>`SELECT ID, EMAIL FROM USERS WHERE COUNTRY = 'GT' ORDER BY EMAIL LIMIT 100;`                           | validate_with_hypopg ON                    | —                                                                                                                                                                                                                                                                                                                                                                           | Sugerencia esperable en `public.users (country, email)`                                               |
+
+## Exponer enpoints

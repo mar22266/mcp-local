@@ -3,3 +3,4 @@ psycopg[binary]
 sqlparse
 pandas
 python-dotenv
+fastapi
