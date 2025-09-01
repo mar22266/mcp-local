@@ -210,7 +210,6 @@ def explain(
         cur.execute(query)
         row = cur.fetchone()
         plan_json = row[0] if isinstance(row, (list, tuple)) else row["QUERY PLAN"]
-        # POSTGRES RETORNA LISTA[OBJ]; TOMAMOS EL PRIMERO
         root = plan_json[0]["Plan"]
 
     hotspot = traverse_plan_for_hotspots(root, analyze)
@@ -233,7 +232,6 @@ def slow_queries(top: int = 20) -> Dict[str, Any]:
         raise RuntimeError("NO HAY CONEXIÓN ACTIVA. LLAMA PRIMERO A connect(dsn).")
 
     with CURRENT_CONN.cursor() as cur:
-        # INFO DE RESET (SI EXISTE)
         stats_reset = None
         try:
             cur.execute("select stats_reset from pg_stat_statements_info")
@@ -380,47 +378,225 @@ def index_suggestions(
     if not CURRENT_CONN:
         raise RuntimeError("NO HAY CONEXIÓN ACTIVA. LLAMA PRIMERO A connect(dsn).")
 
-    suggestions = []
-    explanation = []
+    def _base_name(ident: str) -> str:
+        ident = ident.strip().strip('"')
+        return ident.split(".")[-1]
 
-    if sample_sql:
-        eq_cols, range_cols, order_cols = extract_predicates_and_order(sample_sql)
-        ordered_cols = build_composite_index(eq_cols, range_cols, order_cols)
-        explanation.append(
-            {"eq_cols": eq_cols, "range_cols": range_cols, "order_cols": order_cols}
+    def _same_table(a: str, b: str) -> bool:
+        return _base_name(a).lower() == _base_name(b).lower()
+
+    def _find_target_alias(sql: str, target_table: str) -> Optional[str]:
+        KEYWORDS = {
+            "where",
+            "on",
+            "using",
+            "group",
+            "order",
+            "limit",
+            "offset",
+            "union",
+            "intersect",
+            "except",
+            "join",
+            "inner",
+            "left",
+            "right",
+            "full",
+            "cross",
+            "natural",
+            "window",
+            "having",
+            "values",
+            "returning",
+            "for",
+            "lock",
+            "and",
+            "or",
+            "not",
+            "with",
+        }
+        pat = re.compile(
+            r'\b(from|join)\s+([a-z0-9_\."]+)(?:\s+(?:as\s+)?([a-z_][a-z0-9_]*))?', re.I
         )
-        if table and ordered_cols:
-            idx_cols = ", ".join(ordered_cols)
-            create_sql = f"CREATE INDEX ON {table} ({idx_cols})"
-            suggestion = {
-                "table": table,
-                "columns_ordered": ordered_cols,
-                "create_index_sql": create_sql,
-            }
+        for m in pat.finditer(sql):
+            tbl, alias = m.group(2), m.group(3)
+            if _same_table(tbl, target_table):
+                if alias and alias.lower() not in KEYWORDS:
+                    return alias
+                return _base_name(tbl)
+        return None
 
-            if validate_with_hypopg and _pg_has_extension(CURRENT_CONN, "hypopg"):
-                hypo_name = None
-                try:
-                    with CURRENT_CONN.cursor() as cur:
-                        cur.execute(
-                            "select * from hypopg_create_index(%s)", (create_sql,)
-                        )
-                        res = cur.fetchone()
-                        hypo_name = res.get("indexname") if res else None
+    def _belongs_to_target(
+        col: str, target_alias: Optional[str], target_table: str
+    ) -> bool:
+        c = col.strip().strip('"')
+        parts = [p for p in re.split(r"\.", c) if p]
+        if len(parts) == 1:
+            return True
+        qualifier = parts[-2]
+        if target_alias and qualifier.lower() == target_alias.lower():
+            return True
+        if _same_table(qualifier, target_table):
+            return True
+        return False
 
-                        cur.execute(f"EXPLAIN (FORMAT JSON) {sample_sql}")
-                        plan_json = cur.fetchone()[0]
-                        root = plan_json[0]["Plan"]
-                        used = plan_uses_index(root, hypo_name) if hypo_name else False
+    def _col_only(col: str) -> str:
+        c = col.strip().strip('"')
+        return c.split(".")[-1]
 
-                        suggestion["hypopg_index"] = hypo_name
-                        suggestion["plan_uses_index"] = bool(used)
+    def _dedupe(seq):
+        seen = set()
+        out = []
+        for x in seq:
+            key = x if isinstance(x, str) else tuple(sorted(x.items()))
+            if key not in seen:
+                seen.add(key)
+                out.append(x)
+        return out
 
-                        cur.execute("select hypopg_reset()")
-                except Exception as e:
-                    suggestion["hypopg_error"] = str(e)
+    suggestions: List[Dict[str, Any]] = []
+    explanation: List[Dict[str, Any]] = []
 
-            suggestions.append(suggestion)
+    if not sample_sql:
+        return {"explanation": explanation, "suggestions": suggestions}
+
+    sql = sample_sql.strip()
+    target_alias = _find_target_alias(sql, table) if table else None
+
+    eq_cols: List[str] = []
+    range_cols: List[str] = []
+    order_cols: List[Dict[str, str]] = []
+    try:
+        eq0, rg0, ob0 = extract_predicates_and_order(sql)
+        # Filtrar por tabla objetivo y normalizar
+        eq_cols = [
+            _col_only(c)
+            for c in eq0
+            if _belongs_to_target(c, target_alias, table or "")
+        ]
+        range_cols = [
+            _col_only(c)
+            for c in rg0
+            if _belongs_to_target(c, target_alias, table or "")
+        ]
+        for oc in ob0:
+            if isinstance(oc, dict):
+                c = oc.get("column") or oc.get("col") or ""
+                d = (oc.get("direction") or "asc").lower()
+                if c and _belongs_to_target(c, target_alias, table or ""):
+                    order_cols.append(
+                        {
+                            "column": _col_only(c),
+                            "direction": "desc" if d == "desc" else "asc",
+                        }
+                    )
+            else:
+                c = str(oc)
+                if _belongs_to_target(c, target_alias, table or ""):
+                    order_cols.append({"column": _col_only(c), "direction": "asc"})
+    except Exception:
+        pass
+
+    # Fallback regex si no se detectó nada
+    if not eq_cols and not range_cols and not order_cols:
+        for m in re.finditer(
+            r'([a-z_][a-z0-9_\."]*)\s*=\s*([a-z_][a-z0-9_\."]*)', sql, re.I
+        ):
+            left, right = m.group(1), m.group(2)
+            if table:
+                if _belongs_to_target(left, target_alias, table):
+                    eq_cols.append(_col_only(left))
+                elif _belongs_to_target(right, target_alias, table):
+                    eq_cols.append(_col_only(right))
+            else:
+                eq_cols.append(_col_only(left))
+        for m in re.finditer(
+            r'([a-z_][a-z0-9_\."]*)\s*=\s*(?:\'[^\']*\'|\$\d+|\?|\d+(?:\.\d+)?|true|false|null)',
+            sql,
+            re.I,
+        ):
+            left = m.group(1)
+            if not table or _belongs_to_target(left, target_alias, table):
+                eq_cols.append(_col_only(left))
+        for m in re.finditer(r'([a-z_][a-z0-9_\."]*)\s*(>=|>|<=|<)\s*', sql, re.I):
+            col = m.group(1)
+            if not table or _belongs_to_target(col, target_alias, table):
+                range_cols.append(_col_only(col))
+        for m in re.finditer(r'([a-z_][a-z0-9_\."]*)\s+between\s+', sql, re.I):
+            col = m.group(1)
+            if not table or _belongs_to_target(col, target_alias, table):
+                range_cols.append(_col_only(col))
+        # order by
+        m = re.search(r"\border\s+by\s+(.+?)(?:\blimit\b|$)", sql, re.I | re.S)
+        if m:
+            ob_list = m.group(1)
+            for term in re.split(r"\s*,\s*", ob_list.strip()):
+                mm = re.match(r'([a-z_][a-z0-9_\."]*)\s*(asc|desc)?', term, re.I)
+                if not mm:
+                    continue
+                col, direction = mm.group(1), (mm.group(2) or "asc").lower()
+                if not table or _belongs_to_target(col, target_alias, table):
+                    order_cols.append(
+                        {
+                            "column": _col_only(col),
+                            "direction": "desc" if direction == "desc" else "asc",
+                        }
+                    )
+
+    eq_cols = _dedupe(eq_cols)
+    range_cols = _dedupe(range_cols)
+    order_cols = _dedupe(order_cols)
+
+    # Orden final de columnas del índice igualdades -> rangos -> order by
+    ordered_cols: List[str] = []
+    ordered_cols += eq_cols
+    ordered_cols += [c for c in range_cols if c not in ordered_cols]
+    for oc in order_cols:
+        col = oc["column"]
+        if col not in ordered_cols:
+            ordered_cols.append(f"{col} DESC" if oc.get("direction") == "desc" else col)
+
+    # Explicación de lo detectado
+    explanation.append(
+        {
+            "eq_cols": eq_cols,
+            "range_cols": range_cols,
+            "order_cols": order_cols,
+            "target_alias": target_alias,
+        }
+    )
+
+    # Construir sugerencia y validar opcionalmente con HypoPG
+    if table and ordered_cols:
+        idx_cols_expr = ", ".join(ordered_cols)
+        create_sql = f"CREATE INDEX ON {table} ({idx_cols_expr})"
+        suggestion: Dict[str, Any] = {
+            "table": table,
+            "columns_ordered": ordered_cols,
+            "create_index_sql": create_sql,
+        }
+
+        if validate_with_hypopg and _pg_has_extension(CURRENT_CONN, "hypopg"):
+            try:
+                with CURRENT_CONN.cursor() as cur:
+                    cur.execute("select * from hypopg_create_index(%s)", (create_sql,))
+                    res = cur.fetchone()
+                    hypo_name = res.get("indexname") if res else None
+
+                    cur.execute(f"EXPLAIN (FORMAT JSON) {sql}")
+                    plan_json = cur.fetchone()[0]
+                    root = plan_json[0]["Plan"]
+                    used = plan_uses_index(root, hypo_name) if hypo_name else False
+
+                    suggestion["hypopg_index"] = hypo_name
+                    suggestion["plan_uses_index"] = bool(used)
+
+                    cur.execute("select hypopg_reset()")
+            except Exception as e:
+                # Solo incluir hypopg_error cuando realmente hay error
+                suggestion["hypopg_error"] = str(e)
+
+        suggestions.append(suggestion)
 
     return {"explanation": explanation, "suggestions": suggestions}
 
