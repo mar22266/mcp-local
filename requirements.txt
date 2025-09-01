@@ -1,0 +1,5 @@
+mcp[cli]
+psycopg[binary]
+sqlparse
+pandas
+python-dotenv

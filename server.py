@@ -1,0 +1,452 @@
+#  MCP POSTGRESQL PROFILER SERVER (FASTMCP)
+#  HERRAMIENTAS... CONNECT, EXPLAIN, SLOW_QUERIES, N_PLUS_ONE_SUSPICIONS, INDEX_SUGGESTIONS (CON VALIDACIÓN OPCIONAL HYOPOG)
+# ANDRE MARROQUIN
+
+import argparse
+import json
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+import sqlparse
+import pandas as pd
+
+import psycopg
+from psycopg.rows import dict_row
+from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.session import ServerSession
+
+# estados globales (conexión actual)
+CURRENT_CONN: Optional[psycopg.Connection] = None
+CURRENT_DSN: Optional[str] = None
+
+# utiles para análisis SQL
+EQUALITY_OPS = {"=", "IN", "IS"}
+RANGE_OPS = {">", "<", ">=", "<="}
+
+
+# normaliza SQL para agrupar plantillas
+def normalize_sql(sql: str) -> str:
+    formatted = sqlparse.format(sql, keyword_case="lower", strip_comments=True)
+    # remplazo simple de literales
+    formatted = re.sub(r"\'[^']*\'", "?", formatted)
+    formatted = re.sub(r"\b\d+(\.\d+)?\b", "?", formatted)
+    return re.sub(r"\s+", " ", formatted).strip()
+
+
+# extrae columnas de igualdad, rango y order by
+def extract_predicates_and_order(sql: str) -> Tuple[List[str], List[str], List[str]]:
+    text = sqlparse.format(sql, keyword_case="lower", strip_comments=True)
+    # cclausala wheere
+    where_match = re.search(r"\bwhere\b(.+?)(\border\b|\blimit\b|$)", text, flags=re.S)
+    where = where_match.group(1) if where_match else ""
+    # joins
+    on_parts = re.findall(r"\bon\b\s+(.+?)(?:\bjoin\b|\bwhere\b|$)", text, flags=re.S)
+    predicates = " ".join([where] + on_parts)
+
+    eq_cols: List[str] = []
+    range_cols: List[str] = []
+
+    # captura columnas y operadores
+    for col, op in re.findall(r"([a-z_][\w\.]*)\s*(=|in|is|>=|<=|>|<)", predicates):
+        if op in {"=", "in", "is"}:
+            if col not in eq_cols:
+                eq_cols.append(col)
+        else:
+            if col not in range_cols:
+                range_cols.append(col)
+
+    # order by
+    order = []
+    ob = re.search(r"\border\s+by\s+(.+?)(\blimit\b|$)", text, flags=re.S)
+    if ob:
+        cols = ob.group(1)
+        # separa por comas y captura nombres de columnas
+        for piece in cols.split(","):
+            m = re.search(r"([a-z_][\w\.]*)", piece.strip())
+            if m:
+                c = m.group(1)
+                if c not in order:
+                    order.append(c)
+
+    return eq_cols, range_cols, order
+
+
+# construye lista de columnas para índice compuesto
+def build_composite_index(
+    eq_cols: List[str], range_cols: List[str], order_cols: List[str]
+) -> List[str]:
+    ordered = []
+    for col in eq_cols + range_cols + order_cols:
+        if col not in ordered:
+            ordered.append(col)
+    return ordered
+
+
+# recorre árbol JSON de explain para encontrar nodo dominante
+def traverse_plan_for_hotspots(
+    plan_node: Dict[str, Any], analyze: bool
+) -> Dict[str, Any]:
+    key_time = "Actual Total Time" if analyze else "Total Cost"
+    best = {
+        "node_type": plan_node.get("Node Type", "Unknown"),
+        "metric": plan_node.get(key_time, 0.0),
+        "relation": plan_node.get("Relation Name"),
+        "index_name": plan_node.get("Index Name"),
+    }
+    for child in plan_node.get("Plans", []) or []:
+        cand = traverse_plan_for_hotspots(child, analyze)
+        if cand["metric"] > best["metric"]:
+            best = cand
+    return best
+
+
+# verifica si un plan usa un índice por nombre
+def plan_uses_index(plan_node: Dict[str, Any], idx_name: str) -> bool:
+    if plan_node.get("Index Name") == idx_name:
+        return True
+    for child in plan_node.get("Plans", []) or []:
+        if plan_uses_index(child, idx_name):
+            return True
+    return False
+
+
+# conecta a Postgres y retorna conexión + metadatos
+def _connect_internal(dsn: str) -> Tuple[psycopg.Connection, Dict[str, Any]]:
+    conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
+    with conn.cursor() as cur:
+        cur.execute("select version()")
+        version = cur.fetchone()["version"]
+        cur.execute("select extname from pg_extension")
+        installed = {r["extname"] for r in cur.fetchall()}
+        cur.execute("select name from pg_available_extensions")
+        available = {r["name"] for r in cur.fetchall()}
+    meta = {
+        "server_version": version,
+        "extensions_installed": sorted(installed),
+        "extensions_available": sorted(available),
+    }
+    return conn, meta
+
+
+# verifica si una extensión está instalada
+def _pg_has_extension(conn: psycopg.Connection, name: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("select 1 from pg_extension where extname=%s", (name,))
+        return cur.fetchone() is not None
+
+
+# intenta crear una extensión (puede fallar si no hay privilegios)
+def _pg_try_create_extension(conn: psycopg.Connection, name: str) -> bool:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'create extension if not exists "{name}"')
+        return True
+    except Exception:
+        return False
+
+
+# definición del MCP y contexto
+mcp = FastMCP("PG Profiler MCP")
+
+
+# tipado de contexto (no usado en MVP)
+@dataclass
+class AppCtx:
+    placeholder: str = "OK"
+
+
+# tool connect(dsn)
+@mcp.tool()
+def connect(dsn: str) -> Dict[str, Any]:
+    # abre conexion a Postgres
+    global CURRENT_CONN, CURRENT_DSN
+    if CURRENT_CONN:
+        try:
+            CURRENT_CONN.close()
+        except Exception:
+            pass
+        CURRENT_CONN = None
+    conn, meta = _connect_internal(dsn)
+    CURRENT_CONN = conn
+    CURRENT_DSN = dsn
+
+    # dectar pg_stat_statements
+    HAS_PGSS = _pg_has_extension(conn, "pg_stat_statements")
+    if not HAS_PGSS and "pg_stat_statements" in meta["extensions_available"]:
+        _pg_try_create_extension(conn, "pg_stat_statements")
+        HAS_PGSS = _pg_has_extension(conn, "pg_stat_statements")
+
+    # detectar hypopg
+    HAS_HYPO = _pg_has_extension(conn, "hypopg")
+    if not HAS_HYPO and "hypopg" in meta["extensions_available"]:
+        _pg_try_create_extension(conn, "hypopg")
+        HAS_HYPO = _pg_has_extension(conn, "hypopg")
+
+    meta.update({"pg_stat_statements": HAS_PGSS, "hypopg": HAS_HYPO})
+    return {"connected": True, "dsn": dsn, "meta": meta}
+
+
+# tools de mcp
+@mcp.tool()
+# tool explain(sql, analyze, buffers, timing) devuelve plan + resumen
+def explain(
+    sql: str, analyze: bool = False, buffers: bool = True, timing: bool = True
+) -> Dict[str, Any]:
+    if not CURRENT_CONN:
+        raise RuntimeError("NO HAY CONEXIÓN ACTIVA. LLAMA PRIMERO A connect(dsn).")
+    options = ["FORMAT JSON"]
+    if analyze:
+        options.append("ANALYZE TRUE")
+    if buffers:
+        options.append("BUFFERS TRUE")
+    if timing:
+        options.append("TIMING TRUE")
+
+    query = f"EXPLAIN ({', '.join(options)}) {sql}"
+    with CURRENT_CONN.cursor() as cur:
+        cur.execute(query)
+        row = cur.fetchone()
+        plan_json = row[0] if isinstance(row, (list, tuple)) else row["QUERY PLAN"]
+        # POSTGRES RETORNA LISTA[OBJ]; TOMAMOS EL PRIMERO
+        root = plan_json[0]["Plan"]
+
+    hotspot = traverse_plan_for_hotspots(root, analyze)
+    summary = {
+        "dominant_node": hotspot,
+        "plan_width": root.get("Plan Width"),
+        "startup_cost": root.get("Startup Cost") if not analyze else None,
+        "total_cost": root.get("Total Cost") if not analyze else None,
+        "actual_rows": root.get("Actual Rows") if analyze else None,
+        "actual_total_time_ms": root.get("Actual Total Time") if analyze else None,
+    }
+    return {"plan": plan_json, "summary": summary}
+
+
+# tool slow_queries(top)
+@mcp.tool()
+# lista slow queries desde pg_stat_statements (top) devuelve lista de queries lentas
+def slow_queries(top: int = 20) -> Dict[str, Any]:
+    if not CURRENT_CONN:
+        raise RuntimeError("NO HAY CONEXIÓN ACTIVA. LLAMA PRIMERO A connect(dsn).")
+
+    with CURRENT_CONN.cursor() as cur:
+        # INFO DE RESET (SI EXISTE)
+        stats_reset = None
+        try:
+            cur.execute("select stats_reset from pg_stat_statements_info")
+            r = cur.fetchone()
+            if r:
+                stats_reset = r.get("stats_reset")
+        except Exception:
+            pass
+
+        rows = []
+        # intenta esquema nuevo (pg16+)
+        try:
+            cur.execute(
+                """
+                select queryid, query, calls,
+                       total_exec_time as total_ms,
+                       mean_exec_time  as mean_ms,
+                       rows
+                from pg_stat_statements
+                order by mean_exec_time desc
+                limit %s
+            """,
+                (top,),
+            )
+            rows = cur.fetchall()
+        except Exception:
+            # Fallback a versiones antiguas total_time / mean_time
+            try:
+                cur.execute(
+                    """
+                    select queryid, query, calls,
+                           total_time as total_ms,
+                           mean_time  as mean_ms,
+                           rows
+                    from pg_stat_statements
+                    order by mean_time desc
+                    limit %s
+                """,
+                    (top,),
+                )
+                rows = cur.fetchall()
+            except Exception as e2:
+                return {
+                    "pg_stat_statements": False,
+                    "warning": "pg_stat_statements no instalado o sin permisos",
+                    "error": str(e2),
+                }
+
+    results = []
+    for r in rows:
+        normalized = normalize_sql(r.get("query") or "")
+        results.append(
+            {
+                "queryid": str(r.get("queryid")),
+                "calls": int(r.get("calls") or 0),
+                "rows": int(r.get("rows") or 0),
+                "total_ms": float(r.get("total_ms") or 0.0),
+                "mean_ms": float(r.get("mean_ms") or 0.0),
+                "normalized": normalized[:500],
+            }
+        )
+
+    return {
+        "pg_stat_statements": True,
+        "stats_reset": str(stats_reset) if stats_reset else None,
+        "top": results,
+    }
+
+
+# tool n_plus_one_suspicions(min_calls, max_avg_rows, min_mean_ms) devuelve sospechas N+1
+@mcp.tool()
+def n_plus_one_suspicions(
+    min_calls: int = 20, max_avg_rows: float = 3.0, min_mean_ms: float = 0.5
+) -> Dict[str, Any]:
+    if not CURRENT_CONN:
+        raise RuntimeError("NO HAY CONEXIÓN ACTIVA. LLAMA PRIMERO A connect(dsn).")
+
+    with CURRENT_CONN.cursor() as cur:
+        rows = []
+        try:
+            cur.execute(
+                """
+                select query, calls,
+                       mean_exec_time as mean_ms,
+                       nullif(rows,0)::float / nullif(calls,0) as avg_rows
+                from pg_stat_statements
+                where calls >= %s
+                order by calls desc
+                limit 500
+            """,
+                (min_calls,),
+            )
+            rows = cur.fetchall()
+        except Exception:
+            # Fallback a versiones antiguas
+            try:
+                cur.execute(
+                    """
+                    select query, calls,
+                           mean_time as mean_ms,
+                           nullif(rows,0)::float / nullif(calls,0) as avg_rows
+                    from pg_stat_statements
+                    where calls >= %s
+                    order by calls desc
+                    limit 500
+                """,
+                    (min_calls,),
+                )
+                rows = cur.fetchall()
+            except Exception as e2:
+                return {
+                    "pg_stat_statements": False,
+                    "warning": "pg_stat_statements no instalado o sin permisos",
+                    "error": str(e2),
+                }
+
+    suspects = []
+    for r in rows:
+        avg_rows = float(r.get("avg_rows") or 0.0)
+        mean_ms = float(r.get("mean_ms") or 0.0)
+        if avg_rows <= max_avg_rows and mean_ms >= min_mean_ms:
+            suspects.append(
+                {
+                    "normalized": normalize_sql(r.get("query") or "")[:500],
+                    "calls": int(r.get("calls") or 0),
+                    "avg_rows": avg_rows,
+                    "mean_ms": mean_ms,
+                }
+            )
+
+    suspects.sort(key=lambda x: (x["calls"], x["mean_ms"]), reverse=True)
+    return {"pg_stat_statements": True, "suspicions": suspects[:50]}
+
+
+# propone índices compuestos basados en heurísticas
+# igualdad -> rango -> order by
+# si hay hypopg, crea índice hipotético y verifica si el plan lo usa
+@mcp.tool()
+def index_suggestions(
+    table: Optional[str] = None,
+    sample_sql: Optional[str] = None,
+    validate_with_hypopg: bool = True,
+) -> Dict[str, Any]:
+    if not CURRENT_CONN:
+        raise RuntimeError("NO HAY CONEXIÓN ACTIVA. LLAMA PRIMERO A connect(dsn).")
+
+    suggestions = []
+    explanation = []
+
+    if sample_sql:
+        eq_cols, range_cols, order_cols = extract_predicates_and_order(sample_sql)
+        ordered_cols = build_composite_index(eq_cols, range_cols, order_cols)
+        explanation.append(
+            {"eq_cols": eq_cols, "range_cols": range_cols, "order_cols": order_cols}
+        )
+        if table and ordered_cols:
+            idx_cols = ", ".join(ordered_cols)
+            create_sql = f"CREATE INDEX ON {table} ({idx_cols})"
+            suggestion = {
+                "table": table,
+                "columns_ordered": ordered_cols,
+                "create_index_sql": create_sql,
+            }
+
+            if validate_with_hypopg and _pg_has_extension(CURRENT_CONN, "hypopg"):
+                hypo_name = None
+                try:
+                    with CURRENT_CONN.cursor() as cur:
+                        cur.execute(
+                            "select * from hypopg_create_index(%s)", (create_sql,)
+                        )
+                        res = cur.fetchone()
+                        hypo_name = res.get("indexname") if res else None
+
+                        cur.execute(f"EXPLAIN (FORMAT JSON) {sample_sql}")
+                        plan_json = cur.fetchone()[0]
+                        root = plan_json[0]["Plan"]
+                        used = plan_uses_index(root, hypo_name) if hypo_name else False
+
+                        suggestion["hypopg_index"] = hypo_name
+                        suggestion["plan_uses_index"] = bool(used)
+
+                        cur.execute("select hypopg_reset()")
+                except Exception as e:
+                    suggestion["hypopg_error"] = str(e)
+
+            suggestions.append(suggestion)
+
+    return {"explanation": explanation, "suggestions": suggestions}
+
+
+# el main usa argparse para elegir transporte y parámetros http streamable o stdio
+def main():
+    load_dotenv()
+    parser = argparse.ArgumentParser(description="PG Profiler MCP Server")
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="USA TRANSPORTE HTTP STREAMABLE (POR DEFECTO STDIO)",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="HOST HTTP (SI --http)")
+    parser.add_argument(
+        "--port", type=int, default=8765, help="PUERTO HTTP (SI --http)"
+    )
+    args = parser.parse_args()
+
+    if args.http:
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
+
+
+if __name__ == "__main__":
+    main()

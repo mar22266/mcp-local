@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: mcp-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: mcp
+      POSTGRES_PASSWORD: mcp123
+      POSTGRES_DB: mcpdb
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+volumes:
+  pgdata:
