@@ -105,67 +105,127 @@ Este servidor expone JSON-RPC 2.0 sobre HTTP en un único endpoint.
 - result:
 
 ```bash
-{
-  "tools": [
-    { "name": "connect",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "dsn": { "type": "string", "description": "postgresql://user:pass@host:5432/db" }
-        },
-        "required": ["dsn"],
-        "additionalProperties": false
-      }
-    },
-    { "name": "explain",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "sql":     { "type": "string" },
-          "analyze": { "type": "boolean", "default": true },
-          "buffers": { "type": "boolean", "default": true },
-          "timing":  { "type": "boolean", "default": true }
-        },
-        "required": ["sql"],
-        "additionalProperties": false
-      }
-    },
-    { "name": "slow_queries",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "top": { "type": "integer", "default": 20, "minimum": 1, "maximum": 1000 }
-        },
-        "required": [],
-        "additionalProperties": false
-      }
-    },
-    { "name": "n_plus_one_suspicions",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "min_calls":   { "type": "integer", "default": 20,  "minimum": 1 },
-          "max_avg_rows":{ "type": "number",  "default": 3.0, "minimum": 0 },
-          "min_mean_ms": { "type": "number",  "default": 0.5, "minimum": 0 }
-        },
-        "required": [],
-        "additionalProperties": false
-      }
-    },
-    { "name": "index_suggestions",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "table": { "type": "string", "description": "schema.tabla, ej: public.orders" },
-          "sample_sql": { "type": "string" },
-          "validate_with_hypopg": { "type": "boolean", "default": true }
-        },
-        "required": ["table","sample_sql"],
-        "additionalProperties": false
-      }
+/tools
+[
+  {
+    "name": "connect",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "dsn": {
+          "type": "string",
+          "description": "DSN de PostgreSQL. Ej: postgresql://user:pass@host:5432/db"
+        }
+      },
+      "required": [
+        "dsn"
+      ],
+      "additionalProperties": false
     }
-  ]
-}
+  },
+  {
+    "name": "explain",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "sql": {
+          "type": "string",
+          "description": "Consulta SQL completa a explicar."
+        },
+        "analyze": {
+          "type": "boolean",
+          "description": "Si true, usa EXPLAIN ANALYZE.",
+          "default": true
+        },
+        "buffers": {
+          "type": "boolean",
+          "description": "Incluir métricas de buffers.",
+          "default": true
+        },
+        "timing": {
+          "type": "boolean",
+          "description": "Incluir métricas de tiempo por nodo.",
+          "default": true
+        }
+      },
+      "required": [
+        "sql"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "slow_queries",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "top": {
+          "type": "integer",
+          "description": "Cantidad de filas a devolver.",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "n_plus_one_suspicions",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "min_calls": {
+          "type": "integer",
+          "description": "Mínimo de llamadas por plantilla para considerarla.",
+          "default": 20,
+          "minimum": 1
+        },
+        "max_avg_rows": {
+          "type": "number",
+          "description": "Umbral máximo de filas promedio por llamada (bajo = sospechoso).",
+          "default": 3.0,
+          "minimum": 0
+        },
+        "min_mean_ms": {
+          "type": "number",
+          "description": "Umbral mínimo de tiempo medio en ms.",
+          "default": 0.5,
+          "minimum": 0
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "index_suggestions",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "table": {
+          "type": "string",
+          "description": "Tabla objetivo (schema.qualname). Ej: public.orders"
+        },
+        "sample_sql": {
+          "type": "string",
+          "description": "SQL de ejemplo sobre el que derivar las columnas candidatas."
+        },
+        "validate_with_hypopg": {
+          "type": "boolean",
+          "description": "Si true, valida con HypoPG (si disponible).",
+          "default": true
+        }
+      },
+      "required": [
+        "table",
+        "sample_sql"
+      ],
+      "additionalProperties": false
+    }
+  }
+]
 ```
 
 ### 4) tools/call (alias aceptado: tools.call)
@@ -359,4 +419,3 @@ Si sigues los pasos anteriores, estos son algunos ejemplos de pruebas que puedes
 | **INDEX SUGGESTIONS** | 1           | `table: public.orders`<br>`sample_sql:`<br>`SELECT ID, CREATED_AT FROM ORDERS WHERE USER_ID = 12345 ORDER BY CREATED_AT DESC LIMIT 50;`          | validate_with_hypopg ON (si tienes hypopg) | **Habilitar HypoPG (una vez):**<br>`docker exec -it mcp-postgres psql -U mcp -d mcpdb -c "CREATE EXTENSION IF NOT EXISTS HYPOPG;"`                                                                                                                                                                                                                                          | Sugerencia esperable: **ON public.orders (user_id, created_at DESC) [INCLUDE (id)]**                  |
 | **INDEX SUGGESTIONS** | 2           | `table: public.users`<br>`sample_sql:`<br>`SELECT ID, EMAIL FROM USERS WHERE COUNTRY = 'GT' ORDER BY EMAIL LIMIT 100;`                           | validate_with_hypopg ON                    | —                                                                                                                                                                                                                                                                                                                                                                           | Sugerencia esperable en `public.users (country, email)`                                               |
 
-## Exponer enpoints
