@@ -17,6 +17,8 @@ import psycopg
 from psycopg.rows import dict_row
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.session import ServerSession
+import logging
+import time
 
 # estados globales (conexión actual)
 CURRENT_CONN: Optional[psycopg.Connection] = None
@@ -151,6 +153,43 @@ def _pg_try_create_extension(conn: psycopg.Connection, name: str) -> bool:
 # definición del MCP y contexto
 mcp = FastMCP("PG Profiler MCP")
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
+log = logging.getLogger("mcp.pg")
+
+
+def _truncate(s: str, n: int = 180) -> str:
+    try:
+        s = re.sub(r"\s+", " ", str(s)).strip()
+    except Exception:
+        s = str(s)
+    return s if len(s) <= n else (s[:n] + "…")
+
+
+def _redact_secrets(text: str) -> str:
+    # Redacta user:pass@ en URLs y password= en DSN estilo clave=valor
+    t = re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", text)
+    t = re.sub(r"(?i)(password|pass|pwd)\s*=\s*([^ \']+)", r"\1=***", t)
+    return t
+
+
+def _safe_params_for_log(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    p = dict(params or {})
+    if method in ("tools/call", "tools.call"):
+        name = (p.get("name") or "").strip()
+        args = dict(p.get("arguments") or {})
+        # Sanitiza argumentos sensibles o muy largos
+        if name == "connect" and "dsn" in args:
+            args["dsn"] = _redact_secrets(str(args["dsn"]))
+        if name == "explain" and "sql" in args:
+            args["sql"] = _truncate(str(args["sql"]))
+        if name == "index_suggestions" and "sample_sql" in args:
+            args["sample_sql"] = _truncate(str(args["sample_sql"]))
+        p["arguments"] = args
+    return p
+
 
 # tipado de contexto (no usado en MVP)
 @dataclass
@@ -161,6 +200,8 @@ class AppCtx:
 # tool connect(dsn)
 @mcp.tool()
 def connect(dsn: str) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    log.info("tool_call start name=connect dsn=%s", _redact_secrets(dsn))
     # abre conexion a Postgres
     global CURRENT_CONN, CURRENT_DSN
     if CURRENT_CONN:
@@ -186,6 +227,13 @@ def connect(dsn: str) -> Dict[str, Any]:
         HAS_HYPO = _pg_has_extension(conn, "hypopg")
 
     meta.update({"pg_stat_statements": HAS_PGSS, "hypopg": HAS_HYPO})
+    log.info(
+        "tool_call ok name=connect server=%s pgss=%s hypopg=%s dur_ms=%.2f",
+        meta.get("server_version"),
+        HAS_PGSS,
+        HAS_HYPO,
+        (time.perf_counter() - t0) * 1000,
+    )
     return {"connected": True, "dsn": dsn, "meta": meta}
 
 
@@ -197,6 +245,14 @@ def explain(
 ) -> Dict[str, Any]:
     if not CURRENT_CONN:
         raise RuntimeError("NO HAY CONEXIÓN ACTIVA. LLAMA PRIMERO A connect(dsn).")
+    t0 = time.perf_counter()
+    log.info(
+        "tool_call start name=explain analyze=%s buffers=%s timing=%s sql=%s",
+        analyze,
+        buffers,
+        timing,
+        _truncate(sql),
+    )
     options = ["FORMAT JSON"]
     if analyze:
         options.append("ANALYZE TRUE")
@@ -221,6 +277,13 @@ def explain(
         "actual_rows": root.get("Actual Rows") if analyze else None,
         "actual_total_time_ms": root.get("Actual Total Time") if analyze else None,
     }
+    log.info(
+        "tool_call ok name=explain hotspot=%s metric=%s relation=%s dur_ms=%.2f",
+        hotspot.get("node_type"),
+        hotspot.get("metric"),
+        hotspot.get("relation"),
+        (time.perf_counter() - t0) * 1000,
+    )
     return {"plan": plan_json, "summary": summary}
 
 
@@ -230,6 +293,8 @@ def explain(
 def slow_queries(top: int = 20) -> Dict[str, Any]:
     if not CURRENT_CONN:
         raise RuntimeError("NO HAY CONEXIÓN ACTIVA. LLAMA PRIMERO A connect(dsn).")
+    t0 = time.perf_counter()
+    log.info("tool_call start name=slow_queries top=%s", top)
 
     with CURRENT_CONN.cursor() as cur:
         stats_reset = None
@@ -293,7 +358,11 @@ def slow_queries(top: int = 20) -> Dict[str, Any]:
                 "normalized": normalized[:500],
             }
         )
-
+    log.info(
+        "tool_call ok name=slow_queries rows=%s dur_ms=%.2f",
+        len(results),
+        (time.perf_counter() - t0) * 1000,
+    )
     return {
         "pg_stat_statements": True,
         "stats_reset": str(stats_reset) if stats_reset else None,
@@ -308,6 +377,13 @@ def n_plus_one_suspicions(
 ) -> Dict[str, Any]:
     if not CURRENT_CONN:
         raise RuntimeError("NO HAY CONEXIÓN ACTIVA. LLAMA PRIMERO A connect(dsn).")
+    t0 = time.perf_counter()
+    log.info(
+        "tool_call start name=n_plus_one_suspicions min_calls=%s max_avg_rows=%s min_mean_ms=%s",
+        min_calls,
+        max_avg_rows,
+        min_mean_ms,
+    )
 
     with CURRENT_CONN.cursor() as cur:
         rows = []
@@ -363,6 +439,11 @@ def n_plus_one_suspicions(
             )
 
     suspects.sort(key=lambda x: (x["calls"], x["mean_ms"]), reverse=True)
+    log.info(
+        "tool_call ok name=n_plus_one_suspicions suspects=%s dur_ms=%.2f",
+        len(suspects[:50]),
+        (time.perf_counter() - t0) * 1000,
+    )
     return {"pg_stat_statements": True, "suspicions": suspects[:50]}
 
 
@@ -377,6 +458,13 @@ def index_suggestions(
 ) -> Dict[str, Any]:
     if not CURRENT_CONN:
         raise RuntimeError("NO HAY CONEXIÓN ACTIVA. LLAMA PRIMERO A connect(dsn).")
+    t0 = time.perf_counter()
+    log.info(
+        "tool_call start name=index_suggestions table=%s validate_with_hypopg=%s sample_sql=%s",
+        table,
+        validate_with_hypopg,
+        _truncate(sample_sql or ""),
+    )
 
     def _base_name(ident: str) -> str:
         ident = ident.strip().strip('"')
@@ -458,6 +546,7 @@ def index_suggestions(
     explanation: List[Dict[str, Any]] = []
 
     if not sample_sql:
+
         return {"explanation": explanation, "suggestions": suggestions}
 
     sql = sample_sql.strip()
@@ -598,6 +687,19 @@ def index_suggestions(
 
         suggestions.append(suggestion)
 
+    if suggestions:
+        s0 = suggestions[0]
+        log.info(
+            "tool_call ok name=index_suggestions suggest=%s uses_hypo=%s dur_ms=%.2f",
+            _truncate(s0.get("create_index_sql", "")),
+            s0.get("plan_uses_index"),
+            (time.perf_counter() - t0) * 1000,
+        )
+    else:
+        log.info(
+            "tool_call ok name=index_suggestions suggest=0 dur_ms=%.2f",
+            (time.perf_counter() - t0) * 1000,
+        )
     return {"explanation": explanation, "suggestions": suggestions}
 
 
@@ -630,19 +732,46 @@ def build_jsonrpc_app() -> FastAPI:
 
     @app.post("/")
     async def jsonrpc_entry(request: Request):
+        t0 = time.perf_counter()
+        client_ip = (
+            request.headers.get("cf-connecting-ip")
+            or request.headers.get("x-forwarded-for")
+            or (request.client.host if request.client else "unknown")
+        )
         try:
             payload = await request.json()
         except Exception:
+            log.warning("rpc_parse_error client=%s", client_ip)
             return JSONResponse(_err(None, -32700, "Parse error"), status_code=400)
 
         rid = payload.get("id")
         method = (payload.get("method") or "").strip()
         params = payload.get("params") or {}
 
+        log.info(
+            "rpc_request id=%s method=%s client=%s params=%s",
+            rid,
+            method,
+            client_ip,
+            _safe_params_for_log(method, params),
+        )
+
         # handshake sin estado
         if method == "initialize":
+            log.info(
+                "rpc_response id=%s method=%s status=200 dur_ms=%.2f",
+                rid,
+                method,
+                (time.perf_counter() - t0) * 1000,
+            )
             return JSONResponse(_ok(rid, {"capabilities": {}}))
         if method in ("notifications/initialized", "initialized"):
+            log.info(
+                "rpc_response id=%s method=%s status=200 dur_ms=%.2f",
+                rid,
+                method,
+                (time.perf_counter() - t0) * 1000,
+            )
             return JSONResponse(_ok(rid, {}))
 
         # listar herramientas
@@ -765,6 +894,12 @@ def build_jsonrpc_app() -> FastAPI:
                     },
                 },
             ]
+            log.info(
+                "rpc_response id=%s method=%s status=200 dur_ms=%.2f",
+                rid,
+                method,
+                (time.perf_counter() - t0) * 1000,
+            )
             return JSONResponse(_ok(rid, {"tools": tools}))
 
         # llama a la herramienta de las funciones definidas arriba
@@ -773,24 +908,65 @@ def build_jsonrpc_app() -> FastAPI:
             arguments = params.get("arguments") or {}
             fn = TOOLS_MAP.get(name)
             if not fn:
+                log.warning("tool_call unknown name=%s", name)
+                log.info(
+                    "rpc_response id=%s method=%s status=404 dur_ms=%.2f",
+                    rid,
+                    method,
+                    (time.perf_counter() - t0) * 1000,
+                )
                 return JSONResponse(
                     _err(rid, -32601, f"Unknown tool: {name}"), status_code=404
                 )
             try:
+                log.info("tool_call start name=%s", name)
+                t_tool = time.perf_counter()
                 result = fn(**arguments)
+                log.info(
+                    "tool_call ok name=%s dur_ms=%.2f",
+                    name,
+                    (time.perf_counter() - t_tool) * 1000,
+                )
+                log.info(
+                    "rpc_response id=%s method=%s status=200 dur_ms=%.2f",
+                    rid,
+                    method,
+                    (time.perf_counter() - t0) * 1000,
+                )
                 return JSONResponse(_ok(rid, result))
             except TypeError as e:
                 # error de parámetros
+                log.warning("tool_call invalid_params name=%s error=%s", name, e)
+                log.info(
+                    "rpc_response id=%s method=%s status=400 dur_ms=%.2f",
+                    rid,
+                    method,
+                    (time.perf_counter() - t0) * 1000,
+                )
                 return JSONResponse(
                     _err(rid, -32602, f"Invalid params: {e}"), status_code=400
                 )
             except Exception as e:
                 # error interno de la herramienta
+                log.exception("tool_call error name=%s", name)
+                log.info(
+                    "rpc_response id=%s method=%s status=500 dur_ms=%.2f",
+                    rid,
+                    method,
+                    (time.perf_counter() - t0) * 1000,
+                )
                 return JSONResponse(
                     _err(rid, -32000, f"Tool error: {e}"), status_code=500
                 )
 
         # metodo no encontrado
+        log.warning("rpc_method_not_found id=%s method=%s", rid, method)
+        log.info(
+            "rpc_response id=%s method=%s status=404 dur_ms=%.2f",
+            rid,
+            method,
+            (time.perf_counter() - t0) * 1000,
+        )
         return JSONResponse(
             _err(rid, -32601, f"Method not found: {method}"), status_code=404
         )
@@ -860,7 +1036,13 @@ def main():
     if args.jsonrpc:
         # debe estar definida arriba del archivo (shim JSON-RPC)
         app = build_jsonrpc_app()
-        uvicorn.run(app, host=args.rpc_host, port=args.rpc_port)
+        uvicorn.run(
+            app,
+            host=args.rpc_host,
+            port=args.rpc_port,
+            log_level=LOG_LEVEL.lower(),
+            access_log=False,
+        )
         return
 
     # HTTP streamable Inspector
