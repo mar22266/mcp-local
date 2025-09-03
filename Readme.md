@@ -6,7 +6,7 @@ Servidor MCP local en **Python** para perfilar bases de datos **PostgreSQL**.
 
 Expone herramientas vía **JSON-RPC** para realizar análisis y diagnósticos de consultas.
 
-Credenciales db Por defecto: usuario mcp, password mcp123, DB mcpdb en localhost:5432
+Credenciales de la Base de datos Por defecto: usuario mcp, password mcp123, DB mcpdb en localhost:5432
 
 ## Herramientas Disponibles
 
