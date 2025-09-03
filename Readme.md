@@ -51,18 +51,9 @@ docker compose up -d
 
 Por defecto: usuario mcp, password mcp123, DB mcpdb en localhost:5432
 
-## 2) Iniciar el MCP por HTTP — Terminal B
-
-Activa tu entorno virtual si no lo está:
-
-```
-. .\.venv\Scripts\Activate.ps1   # Windows
-python server.py --http --host 127.0.0.1 --port 8765
-```
-
 Esto abre el transporte HTTP del MCP en: http://127.0.0.1:8765
 
-## 3) Exponer MCP con un túnel público — Terminal C
+## 2) Exponer MCP con un túnel público — Terminal C
 
 en caos de no tenerlo: winget install Cloudflare.cloudflared
 
@@ -76,7 +67,7 @@ Te dará una URL pública tipo: https://<algo>.trycloudflare.com
 
 ### El INTEGRATOR no necesita acceso a tu Postgres ni correr Docker; solo consumirá tu MCP por HTTP.
 
-## MCP Local — Endpoints y Contrato JSON-RPC
+## MCP Local — Endpoints y Contrato JSON-RPC (En terminal B)
 
 Este servidor expone JSON-RPC 2.0 sobre HTTP en un único endpoint.
 
@@ -403,6 +394,14 @@ cloudflared:
 docker exec -it mcp-postgres bash
 apt-get update
 apt-get install -y postgresql-16-hypopg
+```
+##  En caso se quieran hacer pruebas por http, Iniciar el MCP por HTTP 
+
+Activa tu entorno virtual si no lo está:
+
+```
+. .\.venv\Scripts\Activate.ps1   # Windows
+python server.py --http --host 127.0.0.1 --port 8765
 ```
 
 Si sigues los pasos anteriores, estos son algunos ejemplos de pruebas que puedes ejecutar en el **Inspector**:
