@@ -6,6 +6,8 @@ Servidor MCP local en **Python** para perfilar bases de datos **PostgreSQL**.
 
 Expone herramientas vía **JSON-RPC** para realizar análisis y diagnósticos de consultas.
 
+Credenciales db Por defecto: usuario mcp, password mcp123, DB mcpdb en localhost:5432
+
 ## Herramientas Disponibles
 
 - **connect** → Conexión a la base de datos PostgreSQL.
@@ -23,7 +25,7 @@ Mantén abiertas **B y C** mientras alguien te consume.
 
 ---
 
-## 0) Clonar y crear entorno (una vez) — Terminal B
+## Clonar y crear entorno (una vez) — Terminal B
 
 ### Windows PowerShell
 
@@ -43,31 +45,13 @@ pip install -r requirements.txt
 # .env
 ```
 
-## 1) Levantar PostgreSQL (Docker) — Terminal A
+## Levantar PostgreSQL (Docker) — Terminal A
 
 ```bash
 docker compose up -d
 ```
 
-Por defecto: usuario mcp, password mcp123, DB mcpdb en localhost:5432
-
-Esto abre el transporte HTTP del MCP en: http://127.0.0.1:8765
-
-## 2) Exponer MCP con un túnel público — Terminal C
-
-en caos de no tenerlo: winget install Cloudflare.cloudflared
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:8765
-```
-
-Te dará una URL pública tipo: https://<algo>.trycloudflare.com
-
-### Comparte esta URL con el INTEGRATOR (su chatbot la usará como endpoint MCP).
-
-### El INTEGRATOR no necesita acceso a tu Postgres ni correr Docker; solo consumirá tu MCP por HTTP.
-
-## MCP Local — Endpoints y Contrato JSON-RPC (En terminal B)
+## MCP Local — Endpoints y Contrato JSON-RPC 
 
 Este servidor expone JSON-RPC 2.0 sobre HTTP en un único endpoint.
 
@@ -359,20 +343,20 @@ Los chatbots anfitriones deben:
 
 # Cómo ejecutarlo local y exponerlo
 
-## 1. Inicia el servidor en modo JSON-RPC
+## 1. Inicia el servidor en modo JSON-RPC (Terminal B)
 
 ```BASH
 python server.py --jsonrpc --rpc-host 127.0.0.1 --rpc-port 8787
 ```
 
-## 2. Expón una URL pública
+## 2. Expón una URL pública (Terminal C)
 
 cloudflared:
 
 - cloudflared tunnel --url http://localhost:8787
 - Usa la URL mostrada.
 
-## 3. Entrega al integrador:
+## 3. Entrega al integrador tu chatbot:
 
 - Base URL pública (ej. https://abc123.BLABLA.io/)
 - Esta sección de endpoints (métodos y schemas)
@@ -384,28 +368,21 @@ cloudflared:
 - POST / con {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"connect","arguments":{"dsn":"..."}}}
 - Llamar explain, slow_queries, etc., según el flujo de su chatbot.
 
-## Algunos ejemplos para pruebas del funcionamiento del Postgres Profiles
 
-## Tabla de Pruebas
-
-## Instalar paquete de hypopg
+## Instalar paquete de hypopg en caso quieras usarlo
 
 ```bash
 docker exec -it mcp-postgres bash
 apt-get update
 apt-get install -y postgresql-16-hypopg
 ```
-##  En caso se quieran hacer pruebas por http, Iniciar el MCP por HTTP (Terminal B)
 
-Activa tu entorno virtual si no lo está:
-
-```
-. .\.venv\Scripts\Activate.ps1   # Windows
-python server.py --http --host 127.0.0.1 --port 8765
-```
 # Tomar en cuenta que para interactuar con el Postgres Profiler lo primero debde de ser hacer el Connect con la DB
+--------------------------------------------------------------------------------------------------------------------
+# Tabla de Pruebas
+## Algunos ejemplos para pruebas del funcionamiento del Postgres Profiles
 
-Si sigues los pasos anteriores, estos son algunos ejemplos de pruebas que puedes ejecutar en el **Inspector**:
+Si sigues los pasos anteriores, estos son algunos ejemplos de pruebas que puedes ejecutar en el **Chatbot**:
 
 | **Tool**              | **Ejemplo** | **Qué pegar en los campos del Inspector**                                                                                                        | **Toggles**                                | **(Opcional) comandos en terminal**                                                                                                                                                                                                                                                                                                                                         | **Qué deberías ver**                                                                                  |
 | --------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
