@@ -395,7 +395,7 @@ docker exec -it mcp-postgres bash
 apt-get update
 apt-get install -y postgresql-16-hypopg
 ```
-##  En caso se quieran hacer pruebas por http, Iniciar el MCP por HTTP 
+##  En caso se quieran hacer pruebas por http, Iniciar el MCP por HTTP (Terminal B)
 
 Activa tu entorno virtual si no lo está:
 
@@ -403,6 +403,7 @@ Activa tu entorno virtual si no lo está:
 . .\.venv\Scripts\Activate.ps1   # Windows
 python server.py --http --host 127.0.0.1 --port 8765
 ```
+# Tomar en cuenta que para interactuar con el Postgres Profiler lo primero debde de ser hacer el Connect con la DB
 
 Si sigues los pasos anteriores, estos son algunos ejemplos de pruebas que puedes ejecutar en el **Inspector**:
 
